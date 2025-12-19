@@ -4,6 +4,8 @@ from txtai.embeddings import Embeddings
 import sqlite3
 import pickle
 import heapq
+import threading
+import time
 # </editor-fold>
 
 # <editor-fold desc="FILE PATHS">
@@ -24,10 +26,11 @@ id_holes_path = r'C:\Users\visvesh\Documents\DBoperations\holes.pkl'
 K = 40
 IN_KNN_CANDIDATE_LEN = 200
 DELTA = 20
-THRESHOLD = 7
+THRESHOLD = 19#7
 IN_KNN_CANDIDATE_NEIGHBOUR_INDEX = int(K*0.75)
 READ_BATCH_SIZE = 100
 REFRESH_BATCH_SIZE = 100
+REFRESH_QUEUE_OVERLOAD_LIMIT = 500
 TENTATIVE_KNN_FRACTION = 0.4
 # </editor-fold>
 
@@ -48,6 +51,7 @@ while True:
     batch_dict = {k: (v1, v2) for k, v1, v2 in rows} #url, description
     db.update(batch_dict)
 refreshqueue = [set() for i in range(THRESHOLD+1)]
+refreshqueue_overload = False
 # </editor-fold>
 
 # <editor-fold desc="NODE FUNCTIONS">
@@ -73,7 +77,7 @@ def refreshnode(nodeid):
     in_knn_update(nodeid, old_knn, new_knn)
     out_knn[nodeid] = new_knn
 
-def insert(new_internet_data):
+def insert(new_internet_url, new_internet_data):
     new_internet_data_id = max(in_knn)+1 if len(holes)==0 else heapq.heappop(holes)
     candidatelistlen = IN_KNN_CANDIDATE_LEN
     tentative_in_knn = list()
@@ -89,6 +93,10 @@ def insert(new_internet_data):
         else:
             candidatelistlen *= 2
 
+    # duplicate URL not allowed, but duplicate description ok
+    for i in bigquery:
+        if db[i][0] == new_internet_url:
+            return i
     out_knn[new_internet_data_id] = list(bigquery.items())[:K+DELTA]
     in_knn[new_internet_data_id] = []
     in_knn_update(new_internet_data_id, [], out_knn[new_internet_data_id])
@@ -99,7 +107,8 @@ def insert(new_internet_data):
         out_knn[i] = out_knn[i][:K+DELTA]
         in_knn_update(i, old_knn, out_knn[i])
     embeddings.upsert([(new_internet_data_id, new_internet_data)])
-    db[new_internet_data_id]=["URL_PLACEHOLDER", new_internet_data]
+    db[new_internet_data_id]=[new_internet_url, new_internet_data]
+    return new_internet_data_id
 
 def delete(nodeid):
     # assumes node is present
@@ -109,24 +118,23 @@ def delete(nodeid):
     del out_knn[nodeid]
     del in_knn[nodeid]
     embeddings.delete([nodeid])
-    #need to rollback these maybe
-    #db updatte also
     for i in in_knn_id:
         idx = next(j for j,(_,sim) in enumerate(out_knn[i]) if out_knn[i][j][0] == nodeid)
         del out_knn[i][idx]
         if out_knn[i][K-1][0] in in_knn:
             in_knn[out_knn[i][K-1][0]].append(i)
-        #add to process underflow bucket
         knnbuffer = len(out_knn[i])-K
         if knnbuffer > THRESHOLD:
             continue
-        elif knnbuffer == THRESHOLD:
+        if knnbuffer == THRESHOLD:
             refreshqueue[THRESHOLD].add(i)
         elif knnbuffer in range(1, THRESHOLD):
             refreshqueue[knnbuffer].add(i)
             refreshqueue[knnbuffer+1].remove(i)
         else:
             refreshqueue[0].add(i)
+    if any(refreshqueue):
+        small_knn_detected.set()
 
 def refreshbatch():
     ids = []
@@ -166,26 +174,75 @@ def sanity(nodeid):
     return None
 # </editor-fold>
 
+# <editor-fold desc="CONCURRENCY">
+DSlock = threading.Lock() # data structures lock
+fg_idle = threading.Event()
+small_knn_detected = threading.Event()
+def background_batch_refresh():
+    while True:
+        small_knn_detected.wait() # wait until nodes with small knn lengths are detected, if drop below K+threshold
+        fg_idle.wait() #wait until fg is done with processing user activity
+        with DSlock:
+            if not fg_idle.is_set():
+                continue
+            refreshbatch()
+            if not any(refreshqueue):
+                small_knn_detected.clear()
+        if sum(len(i) for i in refreshqueue) >= REFRESH_QUEUE_OVERLOAD_LIMIT:
+            time.sleep(3)
+t = threading.Thread(target=background_batch_refresh)
+t.start()
+# </editor-fold>
+
 # <editor-fold desc="I/O WITH JAVA SPRING BOOT (interactive)">
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stdin.reconfigure(encoding='utf-8')
 while True:
-    task = input().split()
-    if task[0] == "query":
-        query_type = task[1]
-        #input("input query to search for best matching URL (spelling mistakes result in mismatch)")
-        result = []
-        if query_type == "single":
-            query_string = input()
-            result = embeddings.search(query_string, K+DELTA, "dense") # [] or pair<string, float>
-        bestmatches = []
-        print(str(len(result)))
-        for i,match in enumerate(result):
-            print(str(match[0]) + " " + str(len(in_knn[match[0]])))
-    else:
-        print(str(3*len(db)))
-        for key in db.keys():
-            print(str(key)+'\n'+db[key][0]+'\n'+db[key][1])
+    task = input()
+    match task:
+        case "setup":
+            print(str(3*len(db)))
+            for key in db.keys():
+                print(str(key)+'\n'+db[key][0]+'\n'+db[key][1])
+        case "querynode":
+            nodeid = int(input())
+            fg_idle.clear()
+            with DSlock:
+                refreshnode(nodeid)
+                nodeid_knn = [i for i,j in out_knn[nodeid][:40]]
+                nodeid_in_knn_count = len(in_knn[nodeid])
+                in_knn_counts = [len(in_knn[i]) for i in nodeid_knn]
+            fg_idle.set()
+            print("querynode")
+            print(1+len(nodeid_knn))
+            print(nodeid_in_knn_count)
+            for i,neighbour in enumerate(nodeid_knn):
+                print(neighbour, in_knn_counts[i])
+        case "querystring":
+            textquery = input()
+            results = embeddings.search(textquery, K, "dense")
+            results = [i for i,j in results]
+            fg_idle.clear()
+            with DSlock:
+                in_knn_counts = [len(in_knn[i]) for i in results]
+            fg_idle.set()
+            print("querystring")
+            print(len(results))
+            for i,neighbour in enumerate(results):
+                print(neighbour, in_knn_counts[i])
+        case "insert":
+            textquery = input().split(" ",1)
+            fg_idle.clear()
+            with DSlock:
+                new_index = insert(textquery[0], textquery[1])
+            fg_idle.set()
+            print(f"insert\n1\n{new_index}")
+        case "delete":
+            nodeid = int(input())
+            fg_idle.clear()
+            with DSlock:
+                delete(nodeid)
+            fg_idle.set()
 # </editor-fold>
 
 # import threading
