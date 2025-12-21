@@ -26,7 +26,7 @@ id_holes_path = r'C:\Users\visvesh\Documents\DBoperations\holes.pkl'
 K = 40
 IN_KNN_CANDIDATE_LEN = 200
 DELTA = 20
-THRESHOLD = 19#7
+THRESHOLD = 19
 IN_KNN_CANDIDATE_NEIGHBOUR_INDEX = int(K*0.75)
 READ_BATCH_SIZE = 100
 REFRESH_BATCH_SIZE = 100
@@ -50,6 +50,7 @@ while True:
         break
     batch_dict = {k: (v1, v2) for k, v1, v2 in rows} #url, description
     db.update(batch_dict)
+conn.close()
 refreshqueue = [set() for i in range(THRESHOLD+1)]
 refreshqueue_overload = False
 # </editor-fold>
@@ -135,6 +136,7 @@ def delete(nodeid):
             refreshqueue[0].add(i)
     if any(refreshqueue):
         small_knn_detected.set()
+        save_to_disk.clear()
 
 def refreshbatch():
     ids = []
@@ -172,12 +174,16 @@ def sanity(nodeid):
         if i not in out_knn:
             return f"in_knn[{i}], but no out_knn[{i}]"
     return None
+
+def mutual_knn(nodeid):
+    return "".join(['1' if i in in_knn[nodeid] else '0' for i,j in out_knn[nodeid]])
 # </editor-fold>
 
 # <editor-fold desc="CONCURRENCY">
 DSlock = threading.Lock() # data structures lock
 fg_idle = threading.Event()
 small_knn_detected = threading.Event()
+save_to_disk = threading.Event(); save_to_disk.set()
 def background_batch_refresh():
     while True:
         small_knn_detected.wait() # wait until nodes with small knn lengths are detected, if drop below K+threshold
@@ -188,8 +194,9 @@ def background_batch_refresh():
             refreshbatch()
             if not any(refreshqueue):
                 small_knn_detected.clear()
+                save_to_disk.set()
         if sum(len(i) for i in refreshqueue) >= REFRESH_QUEUE_OVERLOAD_LIMIT:
-            time.sleep(3)
+            time.sleep(1)
 t = threading.Thread(target=background_batch_refresh)
 t.start()
 # </editor-fold>
@@ -212,10 +219,13 @@ while True:
                 nodeid_knn = [i for i,j in out_knn[nodeid][:40]]
                 nodeid_in_knn_count = len(in_knn[nodeid])
                 in_knn_counts = [len(in_knn[i]) for i in nodeid_knn]
+                cansave = '1' if save_to_disk.is_set() else '0'
+                mutual_knns=mutual_knn(nodeid)
             fg_idle.set()
-            print("querynode")
-            print(1+len(nodeid_knn))
+            print(3+len(nodeid_knn))
             print(nodeid_in_knn_count)
+            print(mutual_knns)
+            print(cansave)
             for i,neighbour in enumerate(nodeid_knn):
                 print(neighbour, in_knn_counts[i])
         case "querystring":
@@ -225,9 +235,10 @@ while True:
             fg_idle.clear()
             with DSlock:
                 in_knn_counts = [len(in_knn[i]) for i in results]
+                cansave = '1' if save_to_disk.is_set() else '0'
             fg_idle.set()
-            print("querystring")
-            print(len(results))
+            print(1+len(results))
+            print(cansave)
             for i,neighbour in enumerate(results):
                 print(neighbour, in_knn_counts[i])
         case "insert":
@@ -235,12 +246,40 @@ while True:
             fg_idle.clear()
             with DSlock:
                 new_index = insert(textquery[0], textquery[1])
+                cansave = '1' if save_to_disk.is_set() else '0'
+                len_in_knn = len(in_knn[new_index])
+                mutual_knns=mutual_knn(nodeid)
             fg_idle.set()
-            print(f"insert\n1\n{new_index}")
+            print(f"{new_index}\n{len_in_knn}\n{mutual_knns}\n{cansave}")
         case "delete":
             nodeid = int(input())
             fg_idle.clear()
             with DSlock:
                 delete(nodeid)
             fg_idle.set()
+            print("deleted")
+        case "save":
+            while True:
+                save_to_disk.wait()
+                with DSlock:
+                    if not save_to_disk.is_set():
+                        continue
+                    pickle.dump(out_knn, open(out_knn_path, "wb"))
+                    pickle.dump(in_knn, open(in_knn_path, "wb"))
+                    pickle.dump(holes, open(id_holes_path, "wb"))
+                    embeddings.save(r'C:\Users\visvesh\.cache\txtai_embeddings')
+                    conn = sqlite3.connect(database)
+                    cursor = conn.cursor()
+                    for id in db:
+                        cursor.execute('''
+                            INSERT INTO main (id, url, desc)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                url = excluded.url,
+                                desc = excluded.desc
+                        ''', (id, db[id][0], db[id][1]))
+                    conn.commit()
+                    conn.close()
+                    break
+            print("saved")
 # </editor-fold>
