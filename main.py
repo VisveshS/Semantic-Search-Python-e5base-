@@ -16,7 +16,7 @@ model_path = r'C:\Users\visvesh\.cache\huggingface\hub\models--intfloat--e5-base
 embeddings_path = r'C:\Users\visvesh\.cache\txtai_embeddings'
 filename = r'C:\Users\visvesh\Documents\instagram index.txt'
 database = r'C:\Users\visvesh\Documents\store.db'
-in_knn_path = r'C:\Users\visvesh\Documents\DBoperations\in_knn.pkl'
+in_knns_path = r'C:\Users\visvesh\Documents\DBoperations\in_knn.pkl'
 out_knn_path = r'C:\Users\visvesh\Documents\DBoperations\out_knn.pkl'
 id_holes_path = r'C:\Users\visvesh\Documents\DBoperations\holes.pkl'
 # filename = r'C:\Users\visvesh\Documents\youtube_index.txt';
@@ -36,6 +36,7 @@ REFRESH_BATCH_SIZE = 100
 REFRESH_QUEUE_OVERLOAD_LIMIT = 500
 TENTATIVE_KNN_FRACTION = 0.4
 EVENTTIMEOUT = 3 #seconds
+LONGWAIT_PAGERANK = 15 #seconds
 # </editor-fold>
 
 # <editor-fold desc="DATA STRUCTURES (NEEDS DSLOCK TO ACCESS)">
@@ -44,7 +45,9 @@ fg_idle = threading.Event()
 small_knn_detected = threading.Event()
 save_to_disk = threading.Event(); save_to_disk.set()
 out_knn = pickle.load(open(out_knn_path, "rb"))
-in_knn = pickle.load(open(in_knn_path, "rb"))
+in_knns = pickle.load(open(in_knns_path, "rb"))
+in_knn = in_knns["in_knn"]
+in_knn_buffer = in_knns["in_knn_buffer"]
 holes = pickle.load(open(id_holes_path,"rb"))
 embeddings = Embeddings()
 embeddings.load(path=embeddings_path)
@@ -62,29 +65,32 @@ conn.close()
 refreshqueue = [set() for i in range(THRESHOLD+1)]
 refreshqueue_overload = False
 useractive = True
+pagerank = None
+pagerank_stale = True
 # </editor-fold>
 
 # <editor-fold desc="NODE FUNCTIONS">
-def in_knn_update(nodeid, old_knn, new_knn):
+def in_knn_update(nodeid, in_knn_arr, in_knn_type, old_knn, new_knn):
     # assumes id node is still present, it is job of caller to ensure this
-    dicta = dict(old_knn[:K])
-    dictb = dict(new_knn[:K])
+    dicta = dict(old_knn[:K]) if in_knn_type == "active" else dict(old_knn[K:])
+    dictb = dict(new_knn[:K]) if in_knn_type == "active" else dict(new_knn[K:])
     old_knn_only, new_knn_only = [dicta.keys() - dictb.keys()][0], [dictb.keys() - dicta.keys()][0]
     for i in old_knn_only:
-        if i not in in_knn:
+        if i not in in_knn_arr:
             continue
-        idx = next(index for index,nid in enumerate(in_knn[i]) if nid == nodeid)
-        del in_knn[i][idx]
+        idx = in_knn_arr[i].index(nodeid)
+        del in_knn_arr[i][idx]
     for i in new_knn_only:
-        if i not in out_knn:
+        if i not in in_knn_arr:
             continue
-        in_knn[i].append(nodeid)
+        in_knn_arr[i].append(nodeid)
 
 def refreshnode(nodeid):
     old_knn = out_knn[nodeid]
     results = embeddings.search(db[nodeid][1], K + DELTA + 1, "dense")
     new_knn = [(int(neighbour[0]), neighbour[1]) for neighbour in results[1:]]
-    in_knn_update(nodeid, old_knn, new_knn)
+    in_knn_update(nodeid, in_knn, "active",old_knn, new_knn)
+    in_knn_update(nodeid, in_knn_buffer, "buffer",old_knn, new_knn)
     out_knn[nodeid] = new_knn
 
 def insert(new_internet_url, new_internet_data):
@@ -107,15 +113,21 @@ def insert(new_internet_url, new_internet_data):
     for i in bigquery:
         if db[i][0] == new_internet_url:
             return i
+    global pagerank_stale
+    pagerank_stale = True
+    pagerank[new_internet_data_id] = 0.0
     out_knn[new_internet_data_id] = list(bigquery.items())[:K+DELTA]
     in_knn[new_internet_data_id] = []
-    in_knn_update(new_internet_data_id, [], out_knn[new_internet_data_id])
+    in_knn_buffer[new_internet_data_id] = []
+    in_knn_update(new_internet_data_id, in_knn, "active", [], out_knn[new_internet_data_id])
+    in_knn_update(new_internet_data_id, in_knn_buffer, "buffer", [], out_knn[new_internet_data_id])
     for i in tentative_in_knn:
         old_knn = out_knn[i].copy()
         out_knn[i].append((new_internet_data_id, bigquery[i]))
         out_knn[i].sort(key=lambda x:x[1], reverse=True)
         out_knn[i] = out_knn[i][:K+DELTA]
-        in_knn_update(i, old_knn, out_knn[i])
+        in_knn_update(i, in_knn, "active",old_knn, out_knn[i])
+        in_knn_update(i, in_knn_buffer, "buffer",old_knn, out_knn[i])
     embeddings.upsert([(new_internet_data_id, new_internet_data)])
     db[new_internet_data_id]=[new_internet_url, new_internet_data]
     return new_internet_data_id
@@ -123,16 +135,20 @@ def insert(new_internet_url, new_internet_data):
 def delete(nodeid):
     # assumes node is present
     heapq.heappush(holes, nodeid)
-    in_knn_update(nodeid, out_knn[nodeid], [])
-    in_knn_id = in_knn[nodeid]
+    in_knn_update(nodeid, in_knn, "active",out_knn[nodeid], [])
+    in_knn_update(nodeid, in_knn_buffer, "buffer",out_knn[nodeid], [])
+    in_knn_id = in_knn[nodeid]+in_knn_buffer[nodeid]
+    del pagerank[nodeid]
     del out_knn[nodeid]
     del in_knn[nodeid]
+    del in_knn_buffer[nodeid]
     embeddings.delete([nodeid])
     for i in in_knn_id:
-        idx = next(j for j,(_,sim) in enumerate(out_knn[i]) if out_knn[i][j][0] == nodeid)
+        old_knn = out_knn[i].copy()
+        idx = [nid for nid,sim in out_knn[i]].index(nodeid)
         del out_knn[i][idx]
-        if out_knn[i][K-1][0] in in_knn:
-            in_knn[out_knn[i][K-1][0]].append(i)
+        in_knn_update(i, in_knn, "active",old_knn, out_knn[i])
+        in_knn_update(i, in_knn_buffer, "buffer",old_knn, out_knn[i])
         knnbuffer = len(out_knn[i])-K
         if knnbuffer > THRESHOLD:
             continue
@@ -143,6 +159,8 @@ def delete(nodeid):
             refreshqueue[knnbuffer+1].remove(i)
         else:
             refreshqueue[0].add(i)
+    global pagerank_stale
+    pagerank_stale = True
     if any(refreshqueue):
         small_knn_detected.set()
         save_to_disk.clear()
@@ -162,10 +180,11 @@ def refreshbatch():
     results = embeddings.batchsearch([db[nodeid][1] for nodeid in ids], K+DELTA+1, "dense")
     for i in range(len(ids)):
         new_knn = [(int(neighbour[0]), neighbour[1]) for neighbour in results[i][1:]]
-        in_knn_update(ids[i], out_knn[ids[i]], new_knn)
+        in_knn_update(ids[i], in_knn, "active", out_knn[ids[i]], new_knn)
+        in_knn_update(ids[i], in_knn_buffer, "buffer", out_knn[ids[i]], new_knn)
         out_knn[ids[i]]=new_knn
 
-def sanity(nodeid):
+def consistency(nodeid):
     for i,f in out_knn[nodeid][:K]:
         if i not in in_knn:
             return f"{nodeid} neighbour: {i} does not exist"
@@ -189,28 +208,34 @@ def mutual_knn(nodeid):
 # </editor-fold>
 
 # <editor-fold desc="BACKGROUND">
-def pagerank_from_in_knn(in_knn_arr, num_iters=50, d=0.85):
-    """
-    in_knn: list of lists
-        in_knn[i] = list of nodes that link to i
-    num_iters: number of power iterations
-    d: damping factor
-    """
+def pagerank_from_in_knn(in_knn_arr, pr, num_iters=20, d=0.85):
     N = len(in_knn_arr)
     out_degree = 40  # given
     allkeys = list(in_knn.keys())
-
-    # initialize uniformly
-    pr = dict.fromkeys(allkeys, 1.0 / N)
+    if pr is None:
+        pr = dict.fromkeys(allkeys, 1.0 / N)
     for _ in range(num_iters):
         new_pr = dict.fromkeys(allkeys, (1 - d) / N)
         for i in allkeys:
             for j in in_knn[i]:
                 new_pr[i] += d * pr[j] / out_degree
         pr = new_pr
-    for i in pr:
-        pr[i] *= len(pr)
     return pr
+def pagerank_refresh():
+    global pagerank, pagerank_stale
+    longwait = LONGWAIT_PAGERANK
+    while useractive:
+        if not pagerank_stale and longwait!=0: #not stritly thread safe, but not a critical operation, so its tolerable
+            longwait -= 1
+            time.sleep(1)
+        else:
+            fg_idle.wait(timeout=EVENTTIMEOUT) #wait until fg is done with processing user activity
+            with DSlock:
+                if not fg_idle.is_set():
+                    continue
+                pagerank = pagerank_from_in_knn(in_knn, pagerank)
+                pagerank_stale = False
+                longwait = LONGWAIT_PAGERANK
 def background_batch_refresh():
     while useractive:
         small_knn_detected.wait(timeout=EVENTTIMEOUT) # wait until nodes with small knn lengths are detected, if drop below K+threshold
@@ -224,103 +249,114 @@ def background_batch_refresh():
                 save_to_disk.set()
         if sum(len(i) for i in refreshqueue) >= REFRESH_QUEUE_OVERLOAD_LIMIT:
             time.sleep(1)
-t = threading.Thread(target=background_batch_refresh)
-t.start()
+knn_refresh_thread = threading.Thread(target=background_batch_refresh)
+pagerank_refresh_thread = threading.Thread(target=pagerank_refresh)
 # </editor-fold>
 
 # <editor-fold desc="I/O WITH JAVA SPRING BOOT (interactive)">
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stdin.reconfigure(encoding='utf-8')
-try:
-    while useractive:
-        task = input()
-        match task:
-            case "setup":
-                print(len(db))
-            case "querynode":
-                nodeid = int(input())
-                fg_idle.clear()
+while useractive:
+    task = input()
+    match task:
+        case "setup":
+            knn_refresh_thread.start()
+            pagerank_refresh_thread.start()
+            print(len(db))
+        case "querynode":
+            nodeid = int(input())
+            fg_idle.clear()
+            with DSlock:
+                refreshnode(nodeid)
+                nodeid_knn = [i for i, j in out_knn[nodeid][:40]]
+                nodeid_in_knn_count = len(in_knn[nodeid])
+                pr = 0 if pagerank is None else pagerank[nodeid] * len(pagerank)
+                in_knn_counts = [len(in_knn[i]) for i in nodeid_knn]
+                prs = [0 if pagerank is None else pagerank[i] * len(pagerank) for i in nodeid_knn]
+                cansave = '1' if save_to_disk.is_set() else '0'
+                mutual_knns = mutual_knn(nodeid)
+            fg_idle.set()
+            print(db[nodeid][0])
+            print(db[nodeid][1])
+            print(nodeid_in_knn_count)
+            print(pr)
+            print(mutual_knns)
+            print(cansave)
+            print(len(nodeid_knn))
+            for i, neighbour in enumerate(nodeid_knn):
+                print(db[neighbour][0])
+                print(db[neighbour][1])
+                print(neighbour, in_knn_counts[i], prs[i])
+        case "querystring":
+            textquery = input()
+            results = embeddings.search(textquery, K, "dense")
+            results = [i for i, j in results]
+            fg_idle.clear()
+            with DSlock:
+                in_knn_counts = [len(in_knn[i]) for i in results]
+                prs = [0 if pagerank is None else pagerank[i] * len(pagerank) for i in results]
+                cansave = '1' if save_to_disk.is_set() else '0'
+            fg_idle.set()
+            print(cansave)
+            print(len(results))
+            for i, neighbour in enumerate(results):
+                print(db[neighbour][0])
+                print(db[neighbour][1])
+                print(neighbour, in_knn_counts[i], prs[i])
+        case "insert":
+            textquery = input().split(" ", 1)
+            fg_idle.clear()
+            with DSlock:
+                new_index = insert(textquery[0], textquery[1])
+                cansave = '1' if save_to_disk.is_set() else '0'
+                len_in_knn = len(in_knn[new_index])
+                pr = 0 if pagerank is None else pagerank[i] * len(pagerank)
+                mutual_knns = mutual_knn(new_index)
+            fg_idle.set()
+            print(f"{new_index}\n{len_in_knn}\n{pr}\n{mutual_knns}\n{cansave}")
+        case "delete":
+            nodeid = int(input())
+            fg_idle.clear()
+            with DSlock:
+                delete(nodeid)
+            fg_idle.set()
+            print("deleted")
+        case "consistency": #for debugging only. not used in deployment
+            nodeid = int(input())
+            consistent_check = consistency(nodeid)
+            print("CONSISTENT" if consistent_check is not None else consistent_check)
+        case "save":
+            while True:
+                save_to_disk.wait(EVENTTIMEOUT)
                 with DSlock:
-                    refreshnode(nodeid)
-                    nodeid_knn = [i for i, j in out_knn[nodeid][:40]]
-                    nodeid_in_knn_count = len(in_knn[nodeid])
-                    in_knn_counts = [len(in_knn[i]) for i in nodeid_knn]
-                    cansave = '1' if save_to_disk.is_set() else '0'
-                    mutual_knns = mutual_knn(nodeid)
-                fg_idle.set()
-                print(db[nodeid][0])
-                print(db[nodeid][1])
-                print(nodeid_in_knn_count)
-                print(mutual_knns)
-                print(cansave)
-                print(len(nodeid_knn))
-                for i, neighbour in enumerate(nodeid_knn):
-                    print(db[neighbour][0])
-                    print(db[neighbour][1])
-                    print(neighbour, in_knn_counts[i])
-            case "querystring":
-                textquery = input()
-                results = embeddings.search(textquery, K, "dense")
-                results = [i for i, j in results]
-                fg_idle.clear()
-                with DSlock:
-                    in_knn_counts = [len(in_knn[i]) for i in results]
-                    cansave = '1' if save_to_disk.is_set() else '0'
-                fg_idle.set()
-                print(cansave)
-                print(len(results))
-                for i, neighbour in enumerate(results):
-                    print(db[neighbour][0])
-                    print(db[neighbour][1])
-                    print(neighbour, in_knn_counts[i])
-            case "insert":
-                textquery = input().split(" ", 1)
-                fg_idle.clear()
-                with DSlock:
-                    new_index = insert(textquery[0], textquery[1])
-                    cansave = '1' if save_to_disk.is_set() else '0'
-                    len_in_knn = len(in_knn[new_index])
-                    mutual_knns = mutual_knn(nodeid)
-                fg_idle.set()
-                print(f"{new_index}\n{len_in_knn}\n{mutual_knns}\n{cansave}")
-            case "delete":
-                nodeid = int(input())
-                fg_idle.clear()
-                with DSlock:
-                    delete(nodeid)
-                fg_idle.set()
-                print("deleted")
-            case "save":
-                while True:
-                    save_to_disk.wait(EVENTTIMEOUT)
-                    with DSlock:
-                        if not save_to_disk.is_set():
-                            continue
-                        postsave = input()
-                        pickle.dump(out_knn, open(out_knn_path, "wb"))
-                        pickle.dump(in_knn, open(in_knn_path, "wb"))
-                        pickle.dump(holes, open(id_holes_path, "wb"))
-                        embeddings.save(r'C:\Users\visvesh\.cache\txtai_embeddings')
-                        conn = sqlite3.connect(database)
-                        cursor = conn.cursor()
-                        for id in db:
-                            cursor.execute('''
-                                INSERT INTO main (id, url, desc)
-                                VALUES (?, ?, ?)
-                                ON CONFLICT(id) DO UPDATE SET
-                                    url = excluded.url,
-                                    desc = excluded.desc
-                            ''', (id, db[id][0], db[id][1]))
-                        conn.commit()
-                        conn.close()
-                        if postsave == "browse":
-                            print("saved")
-                            break
-                        else:
-                            useractive = False
-                            break
-            case "exit":
-                useractive = False
-except:
-    useractive = False
+                    if not save_to_disk.is_set():
+                        continue
+                    postsave = input()
+                    pickle.dump(out_knn, open(out_knn_path, "wb"))
+                    pickle.dump({"in_knn":in_knn, "in_knn_buffer":in_knn_buffer}, open(in_knns_path, "wb"))
+                    pickle.dump(holes, open(id_holes_path, "wb"))
+                    embeddings.save(r'C:\Users\visvesh\.cache\txtai_embeddings')
+                    conn = sqlite3.connect(database)
+                    cursor = conn.cursor()
+                    for id in db:
+                        cursor.execute('''
+                            INSERT INTO main (id, url, desc)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                url = excluded.url,
+                                desc = excluded.desc
+                        ''', (id, db[id][0], db[id][1]))
+                    conn.commit()
+                    conn.close()
+                    if postsave == "browse":
+                        print("saved")
+                        break
+                    else:
+                        useractive = False
+                        break
+        case "exit":
+            useractive = False
+# except(ex):
+#
+#     useractive = False
 # </editor-fold>
