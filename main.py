@@ -260,8 +260,11 @@ while useractive:
     task = input()
     match task:
         case "setup":
-            knn_refresh_thread.start()
-            pagerank_refresh_thread.start()
+            fg_idle.clear()
+            with DSlock:
+                knn_refresh_thread.start()
+                pagerank_refresh_thread.start()
+            fg_idle.set()
             print(len(db))
         case "querynode":
             nodeid = int(input())
