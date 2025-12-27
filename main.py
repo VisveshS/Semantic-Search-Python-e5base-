@@ -86,12 +86,15 @@ def in_knn_update(nodeid, in_knn_arr, in_knn_type, old_knn, new_knn):
         in_knn_arr[i].append(nodeid)
 
 def refreshnode(nodeid):
+    if nodeid not in out_knn:
+        return 0,False
     old_knn = out_knn[nodeid]
     results = embeddings.search(db[nodeid][1], K + DELTA + 1, "dense")
     new_knn = [(int(neighbour[0]), neighbour[1]) for neighbour in results[1:]]
     in_knn_update(nodeid, in_knn, "active",old_knn, new_knn)
     in_knn_update(nodeid, in_knn_buffer, "buffer",old_knn, new_knn)
     out_knn[nodeid] = new_knn
+    return clustering_score([nodeid]+[i for i,j in out_knn[nodeid][:K]]), True
 
 def insert(new_internet_url, new_internet_data):
     new_internet_data_id = max(in_knn)+1 if len(holes)==0 else heapq.heappop(holes)
@@ -112,7 +115,7 @@ def insert(new_internet_url, new_internet_data):
     # duplicate URL not allowed, but duplicate description ok
     for i in bigquery:
         if db[i][0] == new_internet_url:
-            return i
+            return clustering_score([i]+[i1 for i1,j in out_knn[i][:K]]),i
     global pagerank_stale
     pagerank_stale = True
     pagerank[new_internet_data_id] = 0.0
@@ -130,14 +133,16 @@ def insert(new_internet_url, new_internet_data):
         in_knn_update(i, in_knn_buffer, "buffer",old_knn, out_knn[i])
     embeddings.upsert([(new_internet_data_id, new_internet_data)])
     db[new_internet_data_id]=[new_internet_url, new_internet_data]
-    return new_internet_data_id
+    return clustering_score([new_internet_data_id]+[i for i,j in out_knn[new_internet_data_id][:K]]), new_internet_data_id
 
 def delete(nodeid):
-    # assumes node is present
+    if nodeid not in out_knn:
+        return 0
     heapq.heappush(holes, nodeid)
     in_knn_update(nodeid, in_knn, "active",out_knn[nodeid], [])
     in_knn_update(nodeid, in_knn_buffer, "buffer",out_knn[nodeid], [])
     in_knn_id = in_knn[nodeid]+in_knn_buffer[nodeid]
+    cscore = clustering_score([i for i,j in out_knn[nodeid][:K]])
     del pagerank[nodeid]
     del out_knn[nodeid]
     del in_knn[nodeid]
@@ -164,6 +169,7 @@ def delete(nodeid):
     if any(refreshqueue):
         small_knn_detected.set()
         save_to_disk.clear()
+    return cscore
 
 def refreshbatch():
     ids = []
@@ -205,6 +211,14 @@ def consistency(nodeid):
 
 def mutual_knn(nodeid):
     return "".join(['1' if i in in_knn[nodeid] else '0' for i,j in out_knn[nodeid]])
+
+def clustering_score(nodes):
+    nodes = set(nodes)
+    num_neighbours = 0
+    for nodeid in nodes:
+        in_knn_set = set(in_knn[nodeid])
+        num_neighbours += len(in_knn_set & nodes)
+    return num_neighbours/(len(nodes)*(len(nodes)+1))
 # </editor-fold>
 
 # <editor-fold desc="BACKGROUND">
@@ -270,7 +284,10 @@ while useractive:
             nodeid = int(input())
             fg_idle.clear()
             with DSlock:
-                refreshnode(nodeid)
+                cluster_score, nodeexist = refreshnode(nodeid) #user may request deleted node (clicking back and clicking prev deleted row)
+                print('1' if nodeexist else '0')
+                if not nodeexist:
+                    continue
                 nodeid_knn = [i for i, j in out_knn[nodeid][:40]]
                 nodeid_in_knn_count = len(in_knn[nodeid])
                 pr = 0 if pagerank is None else pagerank[nodeid] * len(pagerank)
@@ -284,6 +301,7 @@ while useractive:
             print(nodeid_in_knn_count)
             print(pr)
             print(mutual_knns)
+            print(cluster_score)
             print(cansave)
             print(len(nodeid_knn))
             for i, neighbour in enumerate(nodeid_knn):
@@ -297,9 +315,11 @@ while useractive:
             fg_idle.clear()
             with DSlock:
                 in_knn_counts = [len(in_knn[i]) for i in results]
+                cscore = clustering_score(results)
                 prs = [0 if pagerank is None else pagerank[i] * len(pagerank) for i in results]
                 cansave = '1' if save_to_disk.is_set() else '0'
             fg_idle.set()
+            print(cscore)
             print(cansave)
             print(len(results))
             for i, neighbour in enumerate(results):
@@ -310,20 +330,20 @@ while useractive:
             textquery = input().split(" ", 1)
             fg_idle.clear()
             with DSlock:
-                new_index = insert(textquery[0], textquery[1])
+                cscore, new_index = insert(textquery[0], textquery[1])
                 cansave = '1' if save_to_disk.is_set() else '0'
                 len_in_knn = len(in_knn[new_index])
                 pr = 0 if pagerank is None else pagerank[i] * len(pagerank)
                 mutual_knns = mutual_knn(new_index)
             fg_idle.set()
-            print(f"{new_index}\n{len_in_knn}\n{pr}\n{mutual_knns}\n{cansave}")
+            print(f"{new_index}\n{len_in_knn}\n{pr}\n{mutual_knns}\n{cscore}\n{cansave}")
         case "delete":
             nodeid = int(input())
             fg_idle.clear()
             with DSlock:
-                delete(nodeid)
+                cscore = delete(nodeid)
             fg_idle.set()
-            print("deleted")
+            print(f"{cscore}\ndeleted")
         case "consistency": #for debugging only. not used in deployment
             nodeid = int(input())
             consistent_check = consistency(nodeid)
