@@ -66,7 +66,7 @@ refreshqueue = [set() for i in range(THRESHOLD+1)]
 refreshqueue_overload = False
 useractive = True
 pagerank = None
-pagerank_stale = True
+pagerank_stale = 20
 # </editor-fold>
 
 # <editor-fold desc="NODE FUNCTIONS">
@@ -117,7 +117,7 @@ def insert(new_internet_url, new_internet_data):
         if db[i][0] == new_internet_url:
             return clustering_score([i]+[i1 for i1,j in out_knn[i][:K]]),i
     global pagerank_stale
-    pagerank_stale = True
+    pagerank_stale = 20
     pagerank[new_internet_data_id] = 0.0
     out_knn[new_internet_data_id] = list(bigquery.items())[:K+DELTA]
     in_knn[new_internet_data_id] = []
@@ -165,7 +165,7 @@ def delete(nodeid):
         else:
             refreshqueue[0].add(i)
     global pagerank_stale
-    pagerank_stale = True
+    pagerank_stale = 20
     if any(refreshqueue):
         small_knn_detected.set()
         save_to_disk.clear()
@@ -222,7 +222,8 @@ def clustering_score(nodes):
 # </editor-fold>
 
 # <editor-fold desc="BACKGROUND">
-def pagerank_from_in_knn(in_knn_arr, pr, num_iters=20, d=0.85):
+def pagerank_from_in_knn(in_knn_arr, pr, num_iters=1, d=0.85):
+    #100K operations per second, min 1 iteration, max 20
     N = len(in_knn_arr)
     out_degree = 40  # given
     allkeys = list(in_knn.keys())
@@ -239,7 +240,8 @@ def pagerank_refresh():
     global pagerank, pagerank_stale
     longwait = LONGWAIT_PAGERANK
     while useractive:
-        if not pagerank_stale and longwait!=0: #not stritly thread safe, but not a critical operation, so its tolerable
+        time.sleep(0.05)
+        if pagerank_stale == 0 and longwait != 0: #not stritly thread safe, but not a critical operation, so its tolerable
             longwait -= 1
             time.sleep(1)
         else:
@@ -247,9 +249,11 @@ def pagerank_refresh():
             with DSlock:
                 if not fg_idle.is_set():
                     continue
+                print("pagerank compute triggered")
                 pagerank = pagerank_from_in_knn(in_knn, pagerank)
-                pagerank_stale = False
-                longwait = LONGWAIT_PAGERANK
+                pagerank_stale = max(pagerank_stale-1,0)
+                if pagerank_stale == 0:
+                    longwait = LONGWAIT_PAGERANK
 def background_batch_refresh():
     while useractive:
         small_knn_detected.wait(timeout=EVENTTIMEOUT) # wait until nodes with small knn lengths are detected, if drop below K+threshold
@@ -311,15 +315,19 @@ while useractive:
         case "querystring":
             textquery = input()
             results = embeddings.search(textquery, K, "dense")
-            results = [i for i, j in results]
+            mutual_knns=""
             fg_idle.clear()
             with DSlock:
-                in_knn_counts = [len(in_knn[i]) for i in results]
+                in_knn_counts = [len(in_knn[i]) for i,j in results]
+                for candidate_neighbour, score in results:
+                    mutual_knns += '1' if out_knn[candidate_neighbour][IN_KNN_CANDIDATE_NEIGHBOUR_INDEX][1] < score else '0'
+                results = [i for i, j in results]
                 cscore = clustering_score(results)
                 prs = [0 if pagerank is None else pagerank[i] * len(pagerank) for i in results]
                 cansave = '1' if save_to_disk.is_set() else '0'
             fg_idle.set()
             print(cscore)
+            print(mutual_knns)
             print(cansave)
             print(len(results))
             for i, neighbour in enumerate(results):
@@ -333,7 +341,7 @@ while useractive:
                 cscore, new_index = insert(textquery[0], textquery[1])
                 cansave = '1' if save_to_disk.is_set() else '0'
                 len_in_knn = len(in_knn[new_index])
-                pr = 0 if pagerank is None else pagerank[i] * len(pagerank)
+                pr = 0 if pagerank is None else pagerank[new_index] * len(pagerank)
                 mutual_knns = mutual_knn(new_index)
             fg_idle.set()
             print(f"{new_index}\n{len_in_knn}\n{pr}\n{mutual_knns}\n{cscore}\n{cansave}")
