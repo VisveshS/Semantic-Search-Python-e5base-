@@ -1,5 +1,5 @@
-In high-dim (**768**) semantic space, topology beats geometry
-(curse of dimensionality), so analyzing KNN Relationship between embeddings is more meaningful
+In high-dim (**768**) semantic space, graph topology gives better insight than euclidian geometry
+(curse of dimensionality makes absolute distances hard to interpret), so analyzing KNN Relationships between embeddings is more meaningful
 
 Embedding used : [huggingface e5-base-v2](https://huggingface.co/intfloat/e5-base-v2)
 
