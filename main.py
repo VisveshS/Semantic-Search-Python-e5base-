@@ -94,7 +94,7 @@ def refreshnode(nodeid):
     in_knn_update(nodeid, in_knn, "active",old_knn, new_knn)
     in_knn_update(nodeid, in_knn_buffer, "buffer",old_knn, new_knn)
     out_knn[nodeid] = new_knn
-    return clustering_score([nodeid]+[i for i,j in out_knn[nodeid][:K]]), True
+    return clustering_score([i for i,j in out_knn[nodeid]][:K]), True
 
 def insert(new_internet_url, new_internet_data):
     new_internet_data_id = max(in_knn)+1 if len(holes)==0 else heapq.heappop(holes)
@@ -115,7 +115,7 @@ def insert(new_internet_url, new_internet_data):
     # duplicate URL not allowed, but duplicate description ok
     for i in bigquery:
         if db[i][0] == new_internet_url:
-            return clustering_score([i]+[i1 for i1,j in out_knn[i][:K]]),i
+            return clustering_score([i1 for i1,j in out_knn[i]][:K]),i
     global pagerank_stale
     pagerank_stale = 20
     pagerank[new_internet_data_id] = 0.0
@@ -133,7 +133,7 @@ def insert(new_internet_url, new_internet_data):
         in_knn_update(i, in_knn_buffer, "buffer",old_knn, out_knn[i])
     embeddings.upsert([(new_internet_data_id, new_internet_data)])
     db[new_internet_data_id]=[new_internet_url, new_internet_data]
-    return clustering_score([new_internet_data_id]+[i for i,j in out_knn[new_internet_data_id][:K]]), new_internet_data_id
+    return clustering_score([i for i,j in out_knn[new_internet_data_id]][:K]), new_internet_data_id
 
 def delete(nodeid):
     if nodeid not in out_knn:
@@ -214,11 +214,12 @@ def mutual_knn(nodeid):
 
 def clustering_score(nodes):
     nodes = set(nodes)
-    num_neighbours = 0
-    for nodeid in nodes:
-        in_knn_set = set(in_knn[nodeid])
-        num_neighbours += len(in_knn_set & nodes)
-    return num_neighbours/(len(nodes)*(len(nodes)+1))
+    coverage = {node: 0 for node in nodes}
+    for j in nodes:
+        neigh_ids = {nid for nid, _ in out_knn[j][:K]}
+        for x in neigh_ids & nodes:
+            coverage[x] += 1
+    return min(coverage.values())
 # </editor-fold>
 
 # <editor-fold desc="BACKGROUND">
@@ -249,7 +250,6 @@ def pagerank_refresh():
             with DSlock:
                 if not fg_idle.is_set():
                     continue
-                print("pagerank compute triggered")
                 pagerank = pagerank_from_in_knn(in_knn, pagerank)
                 pagerank_stale = max(pagerank_stale-1,0)
                 if pagerank_stale == 0:
@@ -307,6 +307,7 @@ while useractive:
             print(mutual_knns)
             print(cluster_score)
             print(cansave)
+            print(len(out_knn))
             print(len(nodeid_knn))
             for i, neighbour in enumerate(nodeid_knn):
                 print(db[neighbour][0])
@@ -322,13 +323,14 @@ while useractive:
                 for candidate_neighbour, score in results:
                     mutual_knns += '1' if out_knn[candidate_neighbour][IN_KNN_CANDIDATE_NEIGHBOUR_INDEX][1] < score else '0'
                 results = [i for i, j in results]
-                cscore = clustering_score(results)
+                cscore = clustering_score(results[1:])
                 prs = [0 if pagerank is None else pagerank[i] * len(pagerank) for i in results]
                 cansave = '1' if save_to_disk.is_set() else '0'
             fg_idle.set()
             print(cscore)
             print(mutual_knns)
             print(cansave)
+            print(len(out_knn))
             print(len(results))
             for i, neighbour in enumerate(results):
                 print(db[neighbour][0])
