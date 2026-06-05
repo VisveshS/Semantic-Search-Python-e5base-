@@ -1,24 +1,23 @@
 # <editor-fold desc="IMPORTS">
 import sys
-from csv import excel
-
-from pandas.core.strings.accessor import cat_core
 from txtai.embeddings import Embeddings
 import sqlite3
 import pickle
 import heapq
 import threading
 import time
+import random
 # </editor-fold>
 
 # <editor-fold desc="FILE PATHS">
 model_path = r'C:\Users\visvesh\.cache\huggingface\hub\models--intfloat--e5-base\snapshots\b533fe4636f4a2507c08ddab40644d20b0006d6a'
 embeddings_path = r'C:\Users\visvesh\.cache\txtai_embeddings'
 filename = r'C:\Users\visvesh\Documents\instagram index.txt'
-database = r'C:\Users\visvesh\Documents\store.db'
+database = r'C:\Users\visvesh\Documents\DBoperations\store.db'
 in_knns_path = r'C:\Users\visvesh\Documents\DBoperations\in_knn.pkl'
 out_knn_path = r'C:\Users\visvesh\Documents\DBoperations\out_knn.pkl'
 id_holes_path = r'C:\Users\visvesh\Documents\DBoperations\holes.pkl'
+privatenotespath = r'C:\Users\visvesh\Documents\privatenotes.txt'
 # filename = r'C:\Users\visvesh\Documents\youtube_index.txt';
 # "C:\Users\visvesh\Documents\instagram index.txt"
 # filename = r'C:\Users\visvesh\Documents\Instagram_Clusters.txt'
@@ -37,6 +36,7 @@ REFRESH_QUEUE_OVERLOAD_LIMIT = 500
 TENTATIVE_KNN_FRACTION = 0.4
 EVENTTIMEOUT = 3 #seconds
 LONGWAIT_PAGERANK = 15 #seconds
+NUMPRIVTAGS = 5 # link utmost 5 private tags
 # </editor-fold>
 
 # <editor-fold desc="DATA STRUCTURES (NEEDS DSLOCK TO ACCESS)">
@@ -44,12 +44,32 @@ DSlock = threading.Lock() # data structures lock
 fg_idle = threading.Event()
 small_knn_detected = threading.Event()
 save_to_disk = threading.Event(); save_to_disk.set()
+private_notes_loaded = threading.Event()
 out_knn = pickle.load(open(out_knn_path, "rb"))
 in_knns = pickle.load(open(in_knns_path, "rb"))
 in_knn = in_knns["in_knn"]
 in_knn_buffer = in_knns["in_knn_buffer"]
 holes = pickle.load(open(id_holes_path,"rb"))
-embeddings = Embeddings()
+embeddings = Embeddings({
+    "path": model_path,
+    "backend": "hnsw",
+    "hnsw": {
+        "efconstruction": 200,  # Better quality, worth the indexing time
+        "m": 16,                # Standard, good recall/memory balance
+        "randomseed": 100,      # Keep for reproducibility
+        "efsearch": 120,        # Better recall for k=40 queries
+    }
+})
+privateEmbeddings = Embeddings({
+    "path": model_path,
+    "backend": "hnsw",
+    "hnsw": {
+        "efconstruction": 200,  # Better quality, worth the indexing time
+        "m": 16,                # Standard, good recall/memory balance
+        "randomseed": 100,      # Keep for reproducibility
+        "efsearch": 120,        # Better recall for k=40 queries
+    }
+}) #ephemeral
 embeddings.load(path=embeddings_path)
 db = {}
 conn = sqlite3.connect(database)
@@ -67,6 +87,29 @@ refreshqueue_overload = False
 useractive = True
 pagerank = None
 pagerank_stale = 20
+privateNotesTags = []
+privateNotesDesc = []
+def parse_file(filepath):
+    global privateNotesTags
+    global privateNotesDesc
+    global privateEmbeddings
+    with open(filepath, "r", encoding="utf-8") as f:
+        blocks = f.read().split("\n\n")   # split by blank lines
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if not lines:
+            continue
+        header = lines[0]                 # first line = header
+        description = "\n".join(lines)  # rest = description
+        privateNotesTags.append(header)
+        privateNotesDesc.append(description)
+    privateNotesTags, privateNotesDesc = privateNotesTags, privateNotesDesc
+    privateEmbeddings.index(privateNotesDesc)
+    private_notes_loaded.set()
+
+t = threading.Thread(target=parse_file, args=[privatenotespath])
+t.start()
+# private_notes_loaded.wait()
 # </editor-fold>
 
 # <editor-fold desc="NODE FUNCTIONS">
@@ -220,6 +263,58 @@ def clustering_score(nodes):
         for x in neigh_ids & nodes:
             coverage[x] += 1
     return min(coverage.values())
+
+def nhopneighbours(start, numhops, numneigh, remaining_set):
+    """
+    BFS expansion up to depth N.
+    Returns set of nodes reachable within N hops (including start).
+    """
+    visited = {start}
+    queue = [(start, 0)]
+    while queue:
+        node, depth = queue.pop(0)
+        if depth == numhops:
+            continue
+        for neigh, score in out_knn.get(node, [])[:min(K,numneigh)]:
+            if neigh not in visited and neigh in remaining_set:
+                visited.add(neigh)
+                queue.append((neigh, depth+1))
+    return visited
+
+def setcover(numhops, numneigh):
+    remaining_set = set(out_knn.keys())
+    remaining_list = list(remaining_set)
+    pos = {x: i for i, x in enumerate(remaining_list)}
+
+    clusters = []
+
+    def remove(x):
+        """O(1) removal from both set + list"""
+        idx = pos[x]
+        last = remaining_list[-1]
+
+        # swap
+        remaining_list[idx] = last
+        pos[last] = idx
+
+        # remove last
+        remaining_list.pop()
+        del pos[x]
+        remaining_set.remove(x)
+
+    while remaining_list:
+        # O(1) random pick
+        node = random.choice(remaining_list)
+
+        cluster = nhopneighbours(node, numhops, numneigh, remaining_set) & remaining_set
+        clusters.append([node, len(cluster)])
+
+        # remove all nodes in cluster
+        for x in cluster:
+            if x in remaining_set:
+                remove(x)
+    clusters.sort(key=lambda x: x[1], reverse=True)
+    return clusters
 # </editor-fold>
 
 # <editor-fold desc="BACKGROUND">
@@ -313,6 +408,13 @@ while useractive:
                 print(db[neighbour][0])
                 print(db[neighbour][1])
                 print(neighbour, in_knn_counts[i], prs[i])
+            if not private_notes_loaded.is_set():
+                print(0)
+            else:
+                print(NUMPRIVTAGS)
+                for i,j in privateEmbeddings.search(db[nodeid][1], NUMPRIVTAGS):
+                    print(privateNotesTags[i])
+                    print(j)
         case "querystring":
             textquery = input()
             results = embeddings.search(textquery, K, "dense")
@@ -336,6 +438,28 @@ while useractive:
                 print(db[neighbour][0])
                 print(db[neighbour][1])
                 print(neighbour, in_knn_counts[i], prs[i])
+            if not private_notes_loaded.is_set():
+                print(0)
+            else:
+                print(NUMPRIVTAGS)
+                for i,j in privateEmbeddings.search(textquery, NUMPRIVTAGS):
+                    print(privateNotesTags[i])
+                    print(j)
+        case "cluster":
+            numhops = int(input())
+            numneigh = int(input())
+            with DSlock:
+                scov = setcover(numhops, numneigh)
+                in_knn_counts = [len(in_knn[i[0]]) for i in scov]
+                prs = [0 if pagerank is None else pagerank[i[0]] * len(pagerank) for i in scov]
+                cansave = '1' if save_to_disk.is_set() else '0'
+            print(cansave)
+            print(len(out_knn))
+            print(len(scov))
+            for i, neighbour in enumerate(scov):
+                print(db[neighbour[0]][0])
+                print(db[neighbour[0]][1])
+                print(neighbour[0], in_knn_counts[i], prs[i], neighbour[1])
         case "insert":
             textquery = input().split(" ", 1)
             fg_idle.clear()
