@@ -74,12 +74,12 @@ embeddings.load(path=embeddings_path)
 db = {}
 conn = sqlite3.connect(database)
 cursor = conn.cursor()
-cursor.execute("select id, url, desc from main")
+cursor.execute("select id, url, desc, fulldesc from main")
 while True:
     rows = cursor.fetchmany(READ_BATCH_SIZE)
     if not rows:
         break
-    batch_dict = {k: (v1, v2) for k, v1, v2 in rows} #url, description
+    batch_dict = {k: (v1, v2, v3) for k, v1, v2, v3 in rows} #url, description
     db.update(batch_dict)
 conn.close()
 refreshqueue = [set() for i in range(THRESHOLD+1)]
@@ -109,6 +109,12 @@ def parse_file(filepath):
 
 t = threading.Thread(target=parse_file, args=[privatenotespath])
 t.start()
+
+def embeddedstring(index):
+    # whats desc2 if fulldesc is null/none
+    url, desc1, desc2 = db[index]
+    return desc2 if desc2 is not None else desc1
+
 # private_notes_loaded.wait()
 # </editor-fold>
 
@@ -132,20 +138,20 @@ def refreshnode(nodeid):
     if nodeid not in out_knn:
         return 0,False
     old_knn = out_knn[nodeid]
-    results = embeddings.search(db[nodeid][1], K + DELTA + 1, "dense")
+    results = embeddings.search(embeddedstring(nodeid), K + DELTA + 1, "dense")
     new_knn = [(int(neighbour[0]), neighbour[1]) for neighbour in results[1:]]
     in_knn_update(nodeid, in_knn, "active",old_knn, new_knn)
     in_knn_update(nodeid, in_knn_buffer, "buffer",old_knn, new_knn)
     out_knn[nodeid] = new_knn
     return clustering_score([i for i,j in out_knn[nodeid]][:K]), True
 
-def insert(new_internet_url, new_internet_data):
+def insert(new_internet_url, new_internet_data, new_full_internet_data):
     new_internet_data_id = max(in_knn)+1 if len(holes)==0 else heapq.heappop(holes)
     candidatelistlen = IN_KNN_CANDIDATE_LEN
     tentative_in_knn = list()
     while True:
         tentative_in_knn.clear()
-        bigquery = embeddings.search(new_internet_data, candidatelistlen, "dense", parameters={"efSearch": candidatelistlen})
+        bigquery = embeddings.search(new_full_internet_data or new_internet_data, candidatelistlen, "dense", parameters={"efSearch": candidatelistlen})
         bigquery = dict(bigquery)
         for candidate_id in bigquery:
             if out_knn[candidate_id][IN_KNN_CANDIDATE_NEIGHBOUR_INDEX][1] < bigquery[candidate_id]:
@@ -174,8 +180,8 @@ def insert(new_internet_url, new_internet_data):
         out_knn[i] = out_knn[i][:K+DELTA]
         in_knn_update(i, in_knn, "active",old_knn, out_knn[i])
         in_knn_update(i, in_knn_buffer, "buffer",old_knn, out_knn[i])
-    embeddings.upsert([(new_internet_data_id, new_internet_data)])
-    db[new_internet_data_id]=[new_internet_url, new_internet_data]
+    embeddings.upsert([(new_internet_data_id, new_full_internet_data or new_internet_data)])
+    db[new_internet_data_id]=(new_internet_url, new_internet_data, new_full_internet_data)
     return clustering_score([i for i,j in out_knn[new_internet_data_id]][:K]), new_internet_data_id
 
 def delete(nodeid):
@@ -226,7 +232,7 @@ def refreshbatch():
     if len(ids)==0:
         return
     #batch of size 100 is pretty optimal. 1.5s
-    results = embeddings.batchsearch([db[nodeid][1] for nodeid in ids], K+DELTA+1, "dense")
+    results = embeddings.batchsearch([embeddedstring(nodeid) for nodeid in ids], K+DELTA+1, "dense")
     for i in range(len(ids)):
         new_knn = [(int(neighbour[0]), neighbour[1]) for neighbour in results[i][1:]]
         in_knn_update(ids[i], in_knn, "active", out_knn[ids[i]], new_knn)
@@ -412,7 +418,7 @@ while useractive:
                 print(0)
             else:
                 print(NUMPRIVTAGS)
-                for i,j in privateEmbeddings.search(db[nodeid][1], NUMPRIVTAGS):
+                for i,j in privateEmbeddings.search(embeddedstring(nodeid), NUMPRIVTAGS):
                     print(privateNotesTags[i])
                     print(j)
         case "querystring":
@@ -462,15 +468,39 @@ while useractive:
                 print(neighbour[0], in_knn_counts[i], prs[i], neighbour[1])
         case "insert":
             textquery = input().split(" ", 1)
+            fulldesc = input().strip() or None
             fg_idle.clear()
             with DSlock:
-                cscore, new_index = insert(textquery[0], textquery[1])
+                cscore, new_index = insert(textquery[0], textquery[1], fulldesc)
                 cansave = '1' if save_to_disk.is_set() else '0'
                 len_in_knn = len(in_knn[new_index])
                 pr = 0 if pagerank is None else pagerank[new_index] * len(pagerank)
                 mutual_knns = mutual_knn(new_index)
             fg_idle.set()
             print(f"{new_index}\n{len_in_knn}\n{pr}\n{mutual_knns}\n{cscore}\n{cansave}")
+        case "rephrase":
+            textquery = input().strip().split(" ", 1)
+            fg_idle.clear()
+            with DSlock:
+                nodeid = int(textquery[0])
+                fulldesc = None if len(textquery) == 1 else textquery[1]
+                tup = db[nodeid][:2] + (fulldesc, )
+                delete(nodeid)
+                cscore, new_index = insert(*tup)
+            fg_idle.set()
+            print(f"{new_index}")
+        case "update":
+            nodeid = int(input().strip())
+            mydata = list(db[nodeid])
+            newdata = input().strip().split(" ", 1)
+            mydata[int(newdata[0])] = "placeholder text" if len(newdata) == 1 else newdata[1]
+            # print(mydata)
+            if mydata[2] is None:
+                delete(nodeid)
+                cscore, nodeid = insert(*mydata)
+            else:
+                db[nodeid] = tuple(mydata)
+            print(f"{nodeid}")
         case "delete":
             nodeid = int(input())
             fg_idle.clear()
@@ -497,12 +527,13 @@ while useractive:
                     cursor = conn.cursor()
                     for id in db:
                         cursor.execute('''
-                            INSERT INTO main (id, url, desc)
-                            VALUES (?, ?, ?)
+                            INSERT INTO main (id, url, desc, fulldesc)
+                            VALUES (?, ?, ?, ?)
                             ON CONFLICT(id) DO UPDATE SET
                                 url = excluded.url,
-                                desc = excluded.desc
-                        ''', (id, db[id][0], db[id][1]))
+                                desc = excluded.desc,
+                                fulldesc = excluded.fulldesc
+                        ''', (id, db[id][0], db[id][1], db[id][2]))
                     conn.commit()
                     conn.close()
                     if postsave == "browse":
