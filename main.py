@@ -420,7 +420,7 @@ while useractive:
                 print(NUMPRIVTAGS)
                 for i,j in privateEmbeddings.search(embeddedstring(nodeid), NUMPRIVTAGS):
                     print(privateNotesTags[i])
-                    print(j)
+                    print(str(i)+" "+str(j))
         case "querystring":
             textquery = input()
             results = embeddings.search(textquery, K, "dense")
@@ -450,7 +450,7 @@ while useractive:
                 print(NUMPRIVTAGS)
                 for i,j in privateEmbeddings.search(textquery, NUMPRIVTAGS):
                     print(privateNotesTags[i])
-                    print(j)
+                    print(str(i)+" "+str(j))
         case "cluster":
             numhops = int(input())
             numneigh = int(input())
@@ -501,6 +501,14 @@ while useractive:
             else:
                 db[nodeid] = tuple(mydata)
             print(f"{nodeid}")
+        case "bulkstring":
+            # x y, where x = 0,1 for private, public embedding and y = id
+            privpub, nodeid = [int(x) for x in input().split(" ")]
+            with DSlock:
+                if privpub == 0:
+                    print(privateNotesDesc[nodeid].replace("\n", "\\n"))
+                else:
+                    print(db[nodeid][2] or db[nodeid][1])
         case "delete":
             nodeid = int(input())
             fg_idle.clear()
