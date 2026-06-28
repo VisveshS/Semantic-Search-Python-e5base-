@@ -5,4 +5,6 @@ Embedding used : [huggingface e5-base-v2](https://huggingface.co/intfloat/e5-bas
 
 txtai is installed in my venv (txtaienv)
 
+this txtai sentence embedding python code is used as a backend script for the following [spring boot](https://github.com/VisveshS/semantic_search_spring_boot) application
+ 
 <img width="512" height="512" alt="sentenceembedding" src="https://github.com/user-attachments/assets/53911596-187f-494d-b249-01c87b024f3a" />
